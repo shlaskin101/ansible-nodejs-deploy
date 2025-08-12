@@ -1,0 +1,251 @@
+---
+- name: Install java and net-tools
+  hosts: nexus_server
+  become: true
+  tasks:
+    - name: Update apt repo and cache
+      apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+    # Nexus bundles its own JDK, but we keep a system JRE around for tooling
+    - name: Install Java 17
+      apt:
+        name: openjdk-17-jre-headless
+        state: present
+
+    - name: Install net-tools
+      apt:
+        name: net-tools
+        state: present
+
+- name: Download and unpack Nexus installer
+  hosts: nexus_server
+  become: true
+  tasks:
+    - name: Check if /opt/nexus exists (idempotency pivot)
+      stat:
+        path: /opt/nexus
+      register: stat_nexus_dir
+
+    - name: Download Nexus archive
+      get_url:
+        url: https://download.sonatype.com/nexus/3/latest-linux-x86_64.tar.gz
+        dest: /opt/nexus-latest.tgz
+        mode: "0644"
+
+    - name: Unpack Nexus when /opt/nexus does not yet exist
+      unarchive:
+        src: /opt/nexus-latest.tgz
+        dest: /opt/
+        remote_src: true
+      when: not stat_nexus_dir.stat.exists
+
+    - name: Find unpacked nexus-* directory
+      find:
+        paths: /opt
+        pattern: "nexus-*"
+        file_type: directory
+      register: find_nexus_dirs
+
+    - name: Rename unpacked folder to /opt/nexus (first run)
+      command: mv "{{ find_nexus_dirs.files[0].path }}" /opt/nexus
+      when: not stat_nexus_dir.stat.exists
+
+- name: Create nexus user and fix permissions
+  hosts: nexus_server
+  become: true
+  tasks:
+    - name: Ensure group nexus exists
+      group:
+        name: nexus
+        state: present
+
+    - name: Ensure user nexus exists
+      user:
+        name: nexus
+        group: nexus
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Ensure sonatype-work root exists
+      file:
+        path: /opt/sonatype-work
+        state: directory
+        owner: nexus
+        group: nexus
+        mode: "0755"
+
+    - name: Ensure nexus data dir exists
+      file:
+        path: /opt/sonatype-work/nexus3
+        state: directory
+        owner: nexus
+        group: nexus
+        mode: "0755"
+
+    - name: Recursively set ownership on /opt/nexus and /opt/sonatype-work
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: nexus
+        group: nexus
+        recurse: yes
+      loop:
+        - /opt/nexus
+        - /opt/sonatype-work
+
+- name: Configure and start Nexus
+  hosts: nexus_server
+  become: true
+  tasks:
+    - name: Ensure nexus.rc exists
+      file:
+        path: /opt/nexus/bin/nexus.rc
+        state: touch
+        owner: nexus
+        group: nexus
+        mode: "0644"
+
+    - name: Set run_as_user to nexus
+      lineinfile:
+        path: /opt/nexus/bin/nexus.rc
+        regexp: "^#?run_as_user=.*"
+        line: 'run_as_user="nexus"'
+        create: yes
+        owner: nexus
+        group: nexus
+        mode: "0644"
+
+    # ↓↓↓ Cap the JVM heap & direct memory so it fits on a 2 GB droplet ↓↓↓
+    - name: Ensure Xms is 512m
+      lineinfile:
+        path: /opt/nexus/bin/nexus.vmoptions
+        regexp: "^-Xms"
+        line: "-Xms512m"
+        create: yes
+        owner: nexus
+        group: nexus
+        mode: "0644"
+
+    - name: Ensure Xmx is 1024m
+      lineinfile:
+        path: /opt/nexus/bin/nexus.vmoptions
+        regexp: "^-Xmx"
+        line: "-Xmx1024m"
+        create: yes
+        owner: nexus
+        group: nexus
+        mode: "0644"
+
+    - name: Ensure MaxDirectMemorySize is 1024m
+      lineinfile:
+        path: /opt/nexus/bin/nexus.vmoptions
+        regexp: "^-XX:MaxDirectMemorySize="
+        line: "-XX:MaxDirectMemorySize=1024m"
+        create: yes
+        owner: nexus
+        group: nexus
+        mode: "0644"
+    # ↑↑↑ Heap caps set via line edits (safe & idempotent) ↑↑↑
+
+    - name: Start Nexus as nexus user
+      become_user: nexus
+      shell: |
+        /opt/nexus/bin/nexus start
+      args:
+        chdir: /opt/nexus/bin
+        executable: /bin/bash
+      register: start_out
+      changed_when: "'already running' not in start_out.stdout | default('')"
+
+    - name: Show start command output
+      debug:
+        var: start_out.stdout_lines
+      when: start_out is defined
+
+    - block:
+        - name: Wait for Nexus to listen on 8081
+          wait_for:
+            host: 127.0.0.1
+            port: 8081
+            delay: 5
+            timeout: 240 # first boot can be slow
+
+      rescue:
+        - name: Note wait_for timeout, will show logs next
+          debug:
+            msg: "Nexus did not open 8081 in time; printing logs for diagnosis."
+
+      always:
+        - name: Show last 80 lines of jvm.log
+          shell: tail -n 80 /opt/sonatype-work/nexus3/log/jvm.log
+          register: jvm_log
+          ignore_errors: yes
+
+        - name: Show last 120 lines of nexus.log (if present)
+          shell: tail -n 120 /opt/sonatype-work/nexus3/log/nexus.log
+          register: nexus_log
+          ignore_errors: yes
+
+        - name: Print jvm.log
+          debug:
+            var: jvm_log.stdout_lines
+          when: jvm_log.stdout is defined
+
+        - name: Print nexus.log
+          debug:
+            var: nexus_log.stdout_lines
+          when: nexus_log.stdout is defined
+
+        - name: Show processes for nexus user
+          shell: ps -u nexus
+          register: ps_nexus
+          ignore_errors: yes
+
+        - name: Print nexus processes
+          debug:
+            var: ps_nexus.stdout_lines
+          when: ps_nexus.stdout is defined
+
+- name: Verify nexus running
+  hosts: nexus_server
+  become: true
+  vars:
+    nexus_port: 8081
+  tasks:
+    - name: Show Nexus processes owned by nexus user
+      command: ps -u nexus -o pid,cmd=
+      register: ps_nexus
+      changed_when: false
+      failed_when: false
+
+    - name: Print Nexus processes
+      debug:
+        var: ps_nexus.stdout_lines
+
+    - name: Check listening on {{ nexus_port }} via ss (fallback to netstat)
+      shell: |
+        ss -lntp | grep ":{{ nexus_port }} " || netstat -plnt | grep ":{{ nexus_port }} "
+      register: port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Print port check result
+      debug:
+        var: port_check.stdout_lines
+
+    - name: Probe HTTP endpoint (localhost)
+      uri:
+        url: "http://127.0.0.1:{{ nexus_port }}/"
+        method: GET
+        return_content: false
+        status_code: 200
+      register: http_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Summarize Nexus health
+      debug:
+        msg:
+          - "Processes: {{ (ps_nexus.stdout_lines | length) | default(0) }} line(s)"
+          - "Listening on {{ nexus_port }}: {{ 'YES' if (port_check.rc == 0) else 'NO' }}"
+          - "HTTP 200 OK: {{ 'YES' if (http_probe.status == 200) else 'NO' }}"
