@@ -1,4 +1,4 @@
-# Automate Node.js Application Deployment (Ansible)
+# Automate Nexus Deployment (Ansible)
 
 Automate provisioning and deployment of a Node.js app to a remote Linux VM (DigitalOcean) using **Ansible**. This repo turns the manual install steps into a repeatable playbook you can run on any server.
 
